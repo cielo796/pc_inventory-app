@@ -1,9 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Item, Category } from "@/types";
-import { categories, sampleItems } from "@/lib/sample-data";
-import { loadItemsFromStorage } from "@/lib/inventory-storage";
+import { categories } from "@/lib/sample-data";
 import { formatCurrency } from "@/lib/utils";
 import PageTabs from "@/components/PageTabs";
 
@@ -158,15 +157,31 @@ function buildCategoryBreakdown(transactions: Transaction[]) {
 }
 
 export default function CashflowPage() {
-  const [items] = useState<Item[]>(() => {
-    if (typeof window === "undefined") return sampleItems;
-    const storedItems = loadItemsFromStorage();
-    return storedItems ?? sampleItems;
-  });
+  const [items, setItems] = useState<Item[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
   const [tab, setTab] = useState<CashflowGranularity>("month");
   const [preset, setPreset] = useState<DatePreset>("all");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        setIsLoading(true);
+        const res = await fetch("/api/items");
+        if (!res.ok) throw new Error("load_failed");
+        const data = (await res.json()) as Item[];
+        setItems(data);
+        setLoadError(null);
+      } catch {
+        setLoadError("データの読み込みに失敗しました。");
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    void load();
+  }, []);
 
   const dateRange = useMemo(() => {
     const now = new Date();
@@ -268,6 +283,13 @@ export default function CashflowPage() {
             </div>
           )}
         </div>
+
+        {loadError && (
+          <div className="text-sm text-red-600">{loadError}</div>
+        )}
+        {isLoading && (
+          <div className="text-sm text-gray-500">読み込み中...</div>
+        )}
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <SummaryCard

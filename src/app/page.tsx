@@ -2,12 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Item, ItemStatus, Category, RecordType } from "@/types";
-import { sampleItems, categories, statuses } from "@/lib/sample-data";
-import {
-  loadItemsFromStorage,
-  normalizeItem,
-  STORAGE_KEY,
-} from "@/lib/inventory-storage";
+import { categories, statuses } from "@/lib/sample-data";
+import { normalizeItem } from "@/lib/inventory-storage";
 import {
   calculateSummary,
   calculateProfit,
@@ -180,27 +176,45 @@ function downloadCsv(filename: string, content: string) {
 
 
 export default function Home() {
-  const [items, setItems] = useState<Item[]>(() => {
-    if (typeof window === "undefined") return sampleItems;
-    const storedItems = loadItemsFromStorage();
-    return storedItems ?? sampleItems;
-  });
+  const [items, setItems] = useState<Item[]>([]);
   const [filterStatus, setFilterStatus] = useState<FilterStatus>(FILTER_ALL);
   const [filterCategory, setFilterCategory] =
     useState<FilterCategory>(FILTER_ALL);
   const [searchQuery, setSearchQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("created-desc");
   const [importError, setImportError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingItem, setEditingItem] = useState<Item | null>(null);
   const hasMounted = useRef(false);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        setIsLoading(true);
+        const res = await fetch("/api/items");
+        if (!res.ok) {
+          throw new Error("load_failed");
+        }
+        const data = (await res.json()) as Item[];
+        setItems(data);
+        setLoadError(null);
+      } catch {
+        setLoadError("データの読み込みに失敗しました。");
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    void load();
+  }, []);
 
   useEffect(() => {
     if (!hasMounted.current) {
       hasMounted.current = true;
       return;
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
   }, [items]);
 
   const filteredItems = useMemo(() => {
@@ -263,25 +277,36 @@ export default function Home() {
 
   const summary = useMemo(() => calculateSummary(items), [items]);
 
-  const handleSaveItem = (formData: Partial<Item>) => {
+  const handleSaveItem = async (formData: Partial<Item>) => {
     const recordType = formData.recordType ?? "item";
     const isExpense = recordType === "expense";
+    setIsSaving(true);
     if (editingItem) {
-      setItems(
-        items.map((item) =>
-          item.id === editingItem.id
-            ? {
-                ...item,
-                ...formData,
-                recordType,
-                purchasePrice: isExpense ? 0 : formData.purchasePrice ?? item.purchasePrice,
-                sellingPrice: isExpense ? null : formData.sellingPrice ?? item.sellingPrice,
-                soldDate: isExpense ? null : formData.soldDate ?? item.soldDate,
-                status: isExpense ? "販売済み" : formData.status ?? item.status,
-              }
-            : item
-        )
-      );
+      const updated: Item = {
+        ...editingItem,
+        ...formData,
+        recordType,
+        purchasePrice: isExpense ? 0 : formData.purchasePrice ?? editingItem.purchasePrice,
+        sellingPrice: isExpense ? null : formData.sellingPrice ?? editingItem.sellingPrice,
+        soldDate: isExpense ? null : formData.soldDate ?? editingItem.soldDate,
+        status: isExpense ? "販売済み" : formData.status ?? editingItem.status,
+      } as Item;
+      try {
+        const res = await fetch(`/api/items/${editingItem.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(updated),
+        });
+        if (!res.ok) throw new Error("save_failed");
+        const saved = (await res.json()) as Item;
+        setItems(
+          items.map((item) => (item.id === saved.id ? saved : item))
+        );
+      } catch {
+        setImportError("保存に失敗しました。");
+        setIsSaving(false);
+        return;
+      }
     } else {
       const newItem: Item = {
         id: Date.now().toString(),
@@ -299,15 +324,35 @@ export default function Home() {
         memo: formData.memo || "",
         createdAt: new Date().toISOString(),
       };
-      setItems([newItem, ...items]);
+      try {
+        const res = await fetch("/api/items", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(newItem),
+        });
+        if (!res.ok) throw new Error("save_failed");
+        const saved = (await res.json()) as Item;
+        setItems([saved, ...items]);
+      } catch {
+        setImportError("保存に失敗しました。");
+        setIsSaving(false);
+        return;
+      }
     }
     setIsModalOpen(false);
     setEditingItem(null);
+    setIsSaving(false);
   };
 
   const handleDeleteItem = (id: string) => {
     if (confirm("この在庫を削除しますか？")) {
-      setItems(items.filter((item) => item.id !== id));
+      fetch(`/api/items/${id}`, { method: "DELETE" })
+        .then(() => {
+          setItems(items.filter((item) => item.id !== id));
+        })
+        .catch(() => {
+          setImportError("削除に失敗しました。");
+        });
     }
   };
 
@@ -330,7 +375,18 @@ export default function Home() {
       const shouldReplace = confirm(
         "既存データを上書きしますか？キャンセルで追加します。"
       );
-      setItems(shouldReplace ? imported : [...imported, ...items]);
+      const mode = shouldReplace ? "replace" : "merge";
+      const res = await fetch("/api/items/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode, items: imported }),
+      });
+      if (!res.ok) {
+        throw new Error("import_failed");
+      }
+      const listRes = await fetch("/api/items");
+      const list = (await listRes.json()) as Item[];
+      setItems(list);
     } catch {
       setImportError("CSVの読み込みに失敗しました。");
     }
@@ -429,6 +485,13 @@ export default function Home() {
             </button>
           </div>
         </div>
+
+        {loadError && (
+          <div className="text-sm text-red-600">{loadError}</div>
+        )}
+        {isLoading && (
+          <div className="text-sm text-gray-500">読み込み中...</div>
+        )}
 
         <div className="bg-white rounded-xl shadow-sm border p-4">
           <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
@@ -632,6 +695,7 @@ export default function Home() {
         <ItemModal
           item={editingItem}
           onSave={handleSaveItem}
+          isSaving={isSaving}
           onClose={() => {
             setIsModalOpen(false);
             setEditingItem(null);
@@ -670,10 +734,12 @@ function SummaryCard({
 function ItemModal({
   item,
   onSave,
+  isSaving,
   onClose,
 }: {
   item: Item | null;
-  onSave: (data: Partial<Item>) => void;
+  onSave: (data: Partial<Item>) => Promise<void>;
+  isSaving: boolean;
   onClose: () => void;
 }) {
   const [formData, setFormData] = useState({
@@ -691,9 +757,9 @@ function ItemModal({
   });
   const isExpense = formData.recordType === "expense";
 
-  const handleSubmit = (event: React.FormEvent) => {
+  const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
-    onSave({
+    await onSave({
       ...formData,
       recordType: formData.recordType,
       sellingPrice: formData.sellingPrice
@@ -930,15 +996,17 @@ function ItemModal({
             <button
               type="button"
               onClick={onClose}
+              disabled={isSaving}
               className="flex-1 px-4 py-2 border rounded-lg text-gray-600 hover:bg-gray-50"
             >
               キャンセル
             </button>
             <button
               type="submit"
+              disabled={isSaving}
               className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
             >
-              保存
+              {isSaving ? "保存中..." : "保存"}
             </button>
           </div>
         </form>
