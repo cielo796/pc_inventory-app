@@ -2,8 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Item, ItemStatus, Category, RecordType } from "@/types";
-import { sampleItems, categories, statuses } from "@/lib/sample-data";
-import { loadItemsFromStorage, STORAGE_KEY } from "@/lib/inventory-storage";
+import { categories, statuses } from "@/lib/sample-data";
+import { normalizeItem } from "@/lib/inventory-storage";
 import {
   calculateSummary,
   calculateProfit,
@@ -13,8 +13,9 @@ import {
 import PageTabs from "@/components/PageTabs";
 
 const FILTER_ALL = "すべて";
+const FILTER_EXPENSE = "費用";
 
-type FilterStatus = ItemStatus | typeof FILTER_ALL;
+type FilterStatus = ItemStatus | typeof FILTER_ALL | typeof FILTER_EXPENSE;
 type FilterCategory = Category | typeof FILTER_ALL;
 type SortKey =
   | "created-desc"
@@ -48,33 +49,179 @@ function compareNullableNumber(
   return direction === "asc" ? a - b : b - a;
 }
 
+const CSV_HEADERS = [
+  "id",
+  "recordType",
+  "name",
+  "category",
+  "purchasePrice",
+  "purchaseDate",
+  "miscExpense",
+  "consumableExpense",
+  "sellingPrice",
+  "soldDate",
+  "status",
+  "memo",
+  "createdAt",
+] as const;
+
+function escapeCsvValue(value: string) {
+  if (value.includes('"') || value.includes(",") || value.includes("\n")) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
+}
+
+function toCsvRow(values: (string | number | null)[]) {
+  return values
+    .map((value) => escapeCsvValue(value === null ? "" : String(value)))
+    .join(",");
+}
+
+function serializeCsv(items: Item[]) {
+  const rows = [CSV_HEADERS.join(",")];
+  items.forEach((item) => {
+    rows.push(
+      toCsvRow([
+        item.id,
+        item.recordType,
+        item.name,
+        item.category,
+        item.purchasePrice,
+        item.purchaseDate,
+        item.miscExpense,
+        item.consumableExpense,
+        item.sellingPrice,
+        item.soldDate,
+        item.status,
+        item.memo,
+        item.createdAt,
+      ])
+    );
+  });
+  return rows.join("\n");
+}
+
+function parseCsv(text: string): string[][] {
+  const rows: string[][] = [];
+  let current: string[] = [];
+  let value = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    const next = text[i + 1];
+    if (inQuotes) {
+      if (char === '"' && next === '"') {
+        value += '"';
+        i += 1;
+      } else if (char === '"') {
+        inQuotes = false;
+      } else {
+        value += char;
+      }
+    } else if (char === '"') {
+      inQuotes = true;
+    } else if (char === ",") {
+      current.push(value);
+      value = "";
+    } else if (char === "\n") {
+      current.push(value);
+      rows.push(current);
+      current = [];
+      value = "";
+    } else if (char !== "\r") {
+      value += char;
+    }
+  }
+  current.push(value);
+  rows.push(current);
+  return rows.filter((row) => row.some((cell) => cell.trim() !== ""));
+}
+
+function rowsToItems(rows: string[][]): Item[] {
+  if (rows.length === 0) return [];
+  const headerRow = rows[0].map((value) => value.trim());
+  const startIndex =
+    headerRow.join(",") === CSV_HEADERS.join(",") ? 1 : 0;
+  return rows.slice(startIndex).flatMap((row) => {
+    const raw: Record<string, unknown> = {};
+    CSV_HEADERS.forEach((header, index) => {
+      const value = row[index] ?? "";
+      if (
+        header === "purchasePrice" ||
+        header === "miscExpense" ||
+        header === "consumableExpense"
+      ) {
+        raw[header] = value === "" ? 0 : Number(value);
+      } else if (header === "sellingPrice") {
+        raw[header] = value === "" ? null : Number(value);
+      } else {
+        raw[header] = value;
+      }
+    });
+    const normalized = normalizeItem(raw);
+    return normalized ? [normalized] : [];
+  });
+}
+
+function downloadCsv(filename: string, content: string) {
+  const blob = new Blob([content], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 
 export default function Home() {
-  const [items, setItems] = useState<Item[]>(() => {
-    if (typeof window === "undefined") return sampleItems;
-    const storedItems = loadItemsFromStorage();
-    return storedItems ?? sampleItems;
-  });
+  const [items, setItems] = useState<Item[]>([]);
   const [filterStatus, setFilterStatus] = useState<FilterStatus>(FILTER_ALL);
   const [filterCategory, setFilterCategory] =
     useState<FilterCategory>(FILTER_ALL);
   const [searchQuery, setSearchQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("created-desc");
+  const [importError, setImportError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingItem, setEditingItem] = useState<Item | null>(null);
   const hasMounted = useRef(false);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        setIsLoading(true);
+        const res = await fetch("/api/items");
+        if (!res.ok) {
+          throw new Error("load_failed");
+        }
+        const data = (await res.json()) as Item[];
+        setItems(data);
+        setLoadError(null);
+      } catch {
+        setLoadError("データの読み込みに失敗しました。");
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    void load();
+  }, []);
 
   useEffect(() => {
     if (!hasMounted.current) {
       hasMounted.current = true;
       return;
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
   }, [items]);
 
   const filteredItems = useMemo(() => {
     let result = items;
-    if (filterStatus !== FILTER_ALL) {
+    if (filterStatus === FILTER_EXPENSE) {
+      result = result.filter((item) => item.recordType === "expense");
+    } else if (filterStatus !== FILTER_ALL) {
       result = result.filter(
         (item) => item.recordType !== "expense" && item.status === filterStatus
       );
@@ -85,7 +232,10 @@ export default function Home() {
     const query = searchQuery.trim().toLowerCase();
     if (query) {
       result = result.filter((item) => {
-        const recordHint = item.recordType === "expense" ? "費用 雑費 消耗品" : "";
+        const recordHint =
+          item.recordType === "expense"
+            ? "費用 雑費 消耗品"
+            : `${item.status} 在庫 販売済み`;
         const haystack = `${item.name} ${item.category} ${item.memo} ${recordHint}`.toLowerCase();
         return haystack.includes(query);
       });
@@ -127,25 +277,36 @@ export default function Home() {
 
   const summary = useMemo(() => calculateSummary(items), [items]);
 
-  const handleSaveItem = (formData: Partial<Item>) => {
+  const handleSaveItem = async (formData: Partial<Item>) => {
     const recordType = formData.recordType ?? "item";
     const isExpense = recordType === "expense";
+    setIsSaving(true);
     if (editingItem) {
-      setItems(
-        items.map((item) =>
-          item.id === editingItem.id
-            ? {
-                ...item,
-                ...formData,
-                recordType,
-                purchasePrice: isExpense ? 0 : formData.purchasePrice ?? item.purchasePrice,
-                sellingPrice: isExpense ? null : formData.sellingPrice ?? item.sellingPrice,
-                soldDate: isExpense ? null : formData.soldDate ?? item.soldDate,
-                status: isExpense ? "販売済み" : formData.status ?? item.status,
-              }
-            : item
-        )
-      );
+      const updated: Item = {
+        ...editingItem,
+        ...formData,
+        recordType,
+        purchasePrice: isExpense ? 0 : formData.purchasePrice ?? editingItem.purchasePrice,
+        sellingPrice: isExpense ? null : formData.sellingPrice ?? editingItem.sellingPrice,
+        soldDate: isExpense ? null : formData.soldDate ?? editingItem.soldDate,
+        status: isExpense ? "販売済み" : formData.status ?? editingItem.status,
+      } as Item;
+      try {
+        const res = await fetch(`/api/items/${editingItem.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(updated),
+        });
+        if (!res.ok) throw new Error("save_failed");
+        const saved = (await res.json()) as Item;
+        setItems(
+          items.map((item) => (item.id === saved.id ? saved : item))
+        );
+      } catch {
+        setImportError("保存に失敗しました。");
+        setIsSaving(false);
+        return;
+      }
     } else {
       const newItem: Item = {
         id: Date.now().toString(),
@@ -163,15 +324,71 @@ export default function Home() {
         memo: formData.memo || "",
         createdAt: new Date().toISOString(),
       };
-      setItems([newItem, ...items]);
+      try {
+        const res = await fetch("/api/items", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(newItem),
+        });
+        if (!res.ok) throw new Error("save_failed");
+        const saved = (await res.json()) as Item;
+        setItems([saved, ...items]);
+      } catch {
+        setImportError("保存に失敗しました。");
+        setIsSaving(false);
+        return;
+      }
     }
     setIsModalOpen(false);
     setEditingItem(null);
+    setIsSaving(false);
   };
 
   const handleDeleteItem = (id: string) => {
     if (confirm("この在庫を削除しますか？")) {
-      setItems(items.filter((item) => item.id !== id));
+      fetch(`/api/items/${id}`, { method: "DELETE" })
+        .then(() => {
+          setItems(items.filter((item) => item.id !== id));
+        })
+        .catch(() => {
+          setImportError("削除に失敗しました。");
+        });
+    }
+  };
+
+  const handleExportCsv = () => {
+    const csv = serializeCsv(items);
+    const dateTag = new Date().toISOString().slice(0, 10);
+    downloadCsv(`inventory-${dateTag}.csv`, csv);
+  };
+
+  const handleImportCsv = async (file: File) => {
+    try {
+      setImportError(null);
+      const text = await file.text();
+      const rows = parseCsv(text);
+      const imported = rowsToItems(rows);
+      if (imported.length === 0) {
+        setImportError("読み込めるデータがありませんでした。");
+        return;
+      }
+      const shouldReplace = confirm(
+        "既存データを上書きしますか？キャンセルで追加します。"
+      );
+      const mode = shouldReplace ? "replace" : "merge";
+      const res = await fetch("/api/items/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode, items: imported }),
+      });
+      if (!res.ok) {
+        throw new Error("import_failed");
+      }
+      const listRes = await fetch("/api/items");
+      const list = (await listRes.json()) as Item[];
+      setItems(list);
+    } catch {
+      setImportError("CSVの読み込みに失敗しました。");
     }
   };
 
@@ -220,7 +437,8 @@ export default function Home() {
 
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
           <div className="flex gap-2 flex-wrap">
-            {([FILTER_ALL, ...statuses] as const).map((status) => (
+            {([FILTER_ALL, ...statuses, FILTER_EXPENSE] as const).map(
+              (status) => (
               <button
                 key={status}
                 onClick={() => setFilterStatus(status)}
@@ -234,16 +452,46 @@ export default function Home() {
               </button>
             ))}
           </div>
-          <button
-            onClick={() => {
-              setEditingItem(null);
-              setIsModalOpen(true);
-            }}
-            className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition"
-          >
-            + 在庫を追加
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={handleExportCsv}
+              className="px-4 py-2 border rounded-lg text-sm font-medium text-gray-600 hover:bg-gray-50"
+            >
+              CSVエクスポート
+            </button>
+            <label className="px-4 py-2 border rounded-lg text-sm font-medium text-gray-600 hover:bg-gray-50 cursor-pointer">
+              CSVインポート
+              <input
+                type="file"
+                accept=".csv,text/csv"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) {
+                    void handleImportCsv(file);
+                  }
+                  event.currentTarget.value = "";
+                }}
+              />
+            </label>
+            <button
+              onClick={() => {
+                setEditingItem(null);
+                setIsModalOpen(true);
+              }}
+              className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition"
+            >
+              + 在庫を追加
+            </button>
+          </div>
         </div>
+
+        {loadError && (
+          <div className="text-sm text-red-600">{loadError}</div>
+        )}
+        {isLoading && (
+          <div className="text-sm text-gray-500">読み込み中...</div>
+        )}
 
         <div className="bg-white rounded-xl shadow-sm border p-4">
           <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
@@ -295,6 +543,9 @@ export default function Home() {
               </select>
             </div>
           </div>
+          {importError && (
+            <div className="mt-3 text-sm text-red-600">{importError}</div>
+          )}
         </div>
 
         <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
@@ -444,6 +695,7 @@ export default function Home() {
         <ItemModal
           item={editingItem}
           onSave={handleSaveItem}
+          isSaving={isSaving}
           onClose={() => {
             setIsModalOpen(false);
             setEditingItem(null);
@@ -482,10 +734,12 @@ function SummaryCard({
 function ItemModal({
   item,
   onSave,
+  isSaving,
   onClose,
 }: {
   item: Item | null;
-  onSave: (data: Partial<Item>) => void;
+  onSave: (data: Partial<Item>) => Promise<void>;
+  isSaving: boolean;
   onClose: () => void;
 }) {
   const [formData, setFormData] = useState({
@@ -503,9 +757,9 @@ function ItemModal({
   });
   const isExpense = formData.recordType === "expense";
 
-  const handleSubmit = (event: React.FormEvent) => {
+  const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
-    onSave({
+    await onSave({
       ...formData,
       recordType: formData.recordType,
       sellingPrice: formData.sellingPrice
@@ -742,15 +996,17 @@ function ItemModal({
             <button
               type="button"
               onClick={onClose}
+              disabled={isSaving}
               className="flex-1 px-4 py-2 border rounded-lg text-gray-600 hover:bg-gray-50"
             >
               キャンセル
             </button>
             <button
               type="submit"
+              disabled={isSaving}
               className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
             >
-              保存
+              {isSaving ? "保存中..." : "保存"}
             </button>
           </div>
         </form>

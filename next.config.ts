@@ -10,6 +10,16 @@ const nextConfig: NextConfig = {
       modules.unshift(projectNodeModules);
     }
     config.resolve.modules = modules;
+    config.experiments = {
+      ...(config.experiments || {}),
+      asyncWebAssembly: true,
+    };
+    config.module = config.module ?? { rules: [] };
+    config.module.rules = config.module.rules ?? [];
+    config.module.rules.push({
+      test: /\.wasm$/,
+      type: "webassembly/async",
+    });
     return config;
   },
 };
